@@ -1,9 +1,9 @@
 from __future__ import annotations
+import os
 import time
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
-from .messages import Message, ToolCall, ToolResult
+from typing import Any, List, Optional
 
 
 @dataclass
@@ -106,8 +106,10 @@ class Tracer:
         return self._agent_traces
     
     def save_to_json(self, path: str) -> None:
-        """Save all traces to a JSON file."""
+        """Save all traces to a JSON file (creating parent dirs)."""
         data = [trace.to_dict() for trace in self._agent_traces]
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     

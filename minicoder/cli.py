@@ -1,9 +1,9 @@
 from __future__ import annotations
+import os
 import sys
 import argparse
-import signal
-from typing import Dict, Any, Optional, List
-import readline
+from typing import Any, Optional, List
+import readline  # noqa: F401 (enables readline support for input())
 
 from .config import get_settings, Settings
 from .agent import Agent
@@ -22,7 +22,6 @@ from .tools.git import GitDiffTool, GitStatusTool
 from .tools.finish import FinishTool
 from .safety import SafetyTool
 from .tracing import Tracer
-from .messages import Message
 
 
 class CLI:
@@ -34,10 +33,14 @@ class CLI:
         self.tracer: Optional[Tracer] = None
     
     def parse_args(self, args: Optional[List[str]] = None) -> argparse.Namespace:
+        try:
+            from rich_argparse import RichHelpFormatter as _HelpFormatter
+        except ImportError:
+            _HelpFormatter = argparse.HelpFormatter
         parser = argparse.ArgumentParser(
             prog="minicoder",
             description="Autonomous coding agent built from first principles",
-            formatter_class=argparse.RichHelpFormatter,
+            formatter_class=_HelpFormatter,
         )
         
         parser.add_argument(
@@ -118,7 +121,38 @@ class CLI:
             default=".env",
             help="Environment file path",
         )
-        
+
+        parser.add_argument(
+            "--session",
+            type=str,
+            default=None,
+            help="Session file path: save state here (new run) "
+            "or load it with --resume",
+        )
+
+        parser.add_argument(
+            "--resume",
+            action="store_true",
+            default=False,
+            help="Resume the session file given by --session",
+        )
+
+        parser.add_argument(
+            "--max-tool-output-chars",
+            type=int,
+            default=None,
+            help="Max characters kept per tool result "
+            "(default: 8000 or MINICODER_MAX_TOOL_OUTPUT_CHARS)",
+        )
+
+        parser.add_argument(
+            "--max-history",
+            type=int,
+            default=None,
+            help="Max messages kept in agent history "
+            "(default: 100 or MINICODER_MAX_HISTORY)",
+        )
+
         return parser.parse_args(args)
     
     def create_provider(
@@ -154,7 +188,15 @@ class CLI:
     def run(self, args: Optional[List[str]] = None) -> int:
         """Run the CLI with the given arguments."""
         parsed = self.parse_args(args)
-        
+
+        # An explicit env file takes part in configuration: load it, then
+        # refresh settings from the environment before CLI flags override.
+        if parsed.env_file and parsed.env_file != ".env":
+            from dotenv import load_dotenv
+
+            load_dotenv(parsed.env_file, override=False)
+            self.settings._initialize_from_env()
+
         # Update settings from CLI args
         if parsed.workspace:
             self.settings.workspace = parsed.workspace
@@ -168,32 +210,49 @@ class CLI:
             self.settings.max_iterations = parsed.max_iterations
         if parsed.max_tool_calls is not None:
             self.settings.max_tool_calls = parsed.max_tool_calls
+        if parsed.max_tool_output_chars is not None:
+            if parsed.max_tool_output_chars > 0:
+                self.settings.max_tool_output_chars = parsed.max_tool_output_chars
+        if parsed.max_history is not None:
+            if parsed.max_history > 0:
+                self.settings.max_history = parsed.max_history
         if parsed.approval_mode:
             self.settings.approval_mode = parsed.approval_mode
-        if parsed.dry_run or parsed.verbose is not None:
-            self.settings.dry_run = parsed.dry_run
-            self.settings.verbose = parsed.verbose
-        
-        # Set verbose from arg if provided
-        if parsed.verbose is not None:
-            self.settings.verbose = parsed.verbose
+        if parsed.dry_run:
+            self.settings.dry_run = True
+        if parsed.verbose:
+            self.settings.verbose = True
         
         # Initialize tracer
         self.tracer = Tracer(verbose=self.settings.verbose)
-        
-        # Get task
+
+        if parsed.resume and not parsed.session:
+            print("Error: --resume requires --session <path>")
+            return 1
+
+        # Get task (optional when resuming: the session provides it)
         task = parsed.task
-        if not task:
+        if not task and not parsed.resume:
             print("Error: No task provided. Use: minicoder 'your task here'")
             return 1
-        
+
         # Print header
         self._print_header()
-        
+
         try:
             # Run the agent
-            result = self._run_agent(task)
-            
+            result = self._run_agent(
+                task,
+                session=parsed.session,
+                resume=parsed.resume,
+                workspace_flag=parsed.workspace,
+            )
+
+            # Persist the session (new runs and resumed runs alike)
+            if parsed.session and self.agent is not None:
+                self.agent.save_session(parsed.session)
+                print(f"\n[SESSION] Session saved to: {parsed.session}")
+
             # Print result
             self._print_result(result)
             
@@ -209,6 +268,13 @@ class CLI:
             return 0 if result.get("finished") else 1
             
         except KeyboardInterrupt:
+            # Save progress so an interrupted run can be resumed.
+            if parsed.session and self.agent is not None:
+                try:
+                    self.agent.save_session(parsed.session)
+                    print(f"\n[SESSION] Session saved to: {parsed.session}")
+                except Exception as e:
+                    print(f"\n[SESSION] Could not save session: {e}")
             print("\n[AGENT] Interrupted by user")
             return 1
         except Exception as e:
@@ -231,7 +297,7 @@ class CLI:
         
         panel = Panel(
             header_text,
-            subtitle="Provider: {self.settings.provider}, Model: {self.settings.model}",
+            subtitle=f"Provider: {self.settings.provider}, Model: {self.settings.model}",
             border_style="blue",
         )
         
@@ -260,18 +326,58 @@ class CLI:
             for err in result["errors"][:5]:
                 console.print(f"  - {err}")
     
-    def _run_agent(self, task: str) -> dict[str, Any]:
+    def _run_agent(
+        self,
+        task: str,
+        session: Optional[str] = None,
+        resume: bool = False,
+        workspace_flag: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Run the agent loop."""
         from .agent import Agent
-        
+        from .state import AgentState
+
         settings = self.settings
+
+        # Validate the session file first so a missing/corrupt session
+        # fails gracefully before any provider/registry setup.
+        loaded_state = None
+        loaded_total = 0
+        if resume:
+            assert session is not None  # checked in run()
+            try:
+                loaded_state, loaded_total = AgentState.load(session)
+            except (FileNotFoundError, ValueError) as e:
+                return {
+                    "finished": False,
+                    "final_response": None,
+                    "modified_files": [],
+                    "errors": [f"Cannot resume session: {e}"],
+                    "iterations": 0,
+                    "tool_calls": 0,
+                }
+            if task and task != loaded_state.task:
+                print(
+                    "[SESSION] Resuming stored task; "
+                    f"ignoring CLI task: {task!r}"
+                )
+            if workspace_flag and workspace_flag != loaded_state.workspace:
+                print(
+                    "[SESSION] Resuming stored workspace "
+                    f"({loaded_state.workspace}); ignoring --workspace"
+                )
         
         # Create LLM client
-        api_key = settings.api_key or os.environ.get(
-            {"openai": "OPENAI_API_KEY",
-             "anthropic": "ANTHROPIC_API_KEY",
-             "openai-compatible": "OPENAI_COMPATIBLE_API_KEY"}.get(
-                 settings.provider, "OPENAI_API_KEY")
+        api_key = (
+            settings.api_key
+            or settings.get_provider_config("api_key", "")
+            or os.environ.get(
+                {"openai": "OPENAI_API_KEY",
+                 "anthropic": "ANTHROPIC_API_KEY",
+                 "openai-compatible": "OPENAI_COMPATIBLE_API_KEY"}.get(
+                     settings.provider, "OPENAI_API_KEY"),
+                "",
+            )
         )
         
         llm_client = self.create_provider(
@@ -285,39 +391,61 @@ class CLI:
         registry = ToolRegistry()
         
         # Register all tools
-        registry.register(ListFilesTool(workspace=settings.workspace))
-        registry.register(ReadFileTool(workspace=settings.workspace))
+        cap = settings.max_tool_output_chars
+        registry.register(ListFilesTool(workspace=settings.workspace, max_chars=cap))
+        registry.register(ReadFileTool(workspace=settings.workspace, max_chars=cap))
         registry.register(WriteFileTool(workspace=settings.workspace))
         registry.register(ApplyPatchTool(workspace=settings.workspace))
-        registry.register(RunCommandTool(workspace=settings.workspace, timeout=settings.timeout))
-        registry.register(SearchFilesTool(workspace=settings.workspace))
-        registry.register(GitDiffTool(workspace=settings.workspace))
-        registry.register(GitStatusTool(workspace=settings.workspace))
+        registry.register(RunCommandTool(
+            workspace=settings.workspace,
+            timeout=settings.timeout,
+            max_output_chars=cap,
+        ))
+        registry.register(SearchFilesTool(workspace=settings.workspace, max_chars=cap))
+        registry.register(GitDiffTool(workspace=settings.workspace, max_chars=cap))
+        registry.register(GitStatusTool(workspace=settings.workspace, max_chars=cap))
         registry.register(FinishTool())
         registry.register(SafetyTool(workspace=settings.workspace))
         
         # Create agent
-        self.agent = Agent(
-            llm_client=llm_client,
-            registry=registry,
-            task=task,
-            workspace=settings.workspace,
-            max_iterations=settings.max_iterations,
-            max_tool_calls=settings.max_tool_calls,
-            approval_mode=settings.approval_mode,
-            dry_run=settings.dry_run,
-            tracer=self.tracer,
-            verbose=settings.verbose,
-        )
-        
+        if resume:
+            assert loaded_state is not None  # loaded above
+            self.agent = Agent(
+                llm_client=llm_client,
+                registry=registry,
+                task=loaded_state.task,
+                workspace=loaded_state.workspace,
+                max_iterations=loaded_state.max_iterations,
+                max_tool_calls=settings.max_tool_calls,
+                approval_mode=settings.approval_mode,
+                dry_run=settings.dry_run,
+                tracer=self.tracer,
+                verbose=settings.verbose,
+                state=loaded_state,
+                total_tool_calls=loaded_total,
+                max_history=settings.max_history,
+            )
+        else:
+            self.agent = Agent(
+                llm_client=llm_client,
+                registry=registry,
+                task=task,
+                workspace=settings.workspace,
+                max_iterations=settings.max_iterations,
+                max_tool_calls=settings.max_tool_calls,
+                approval_mode=settings.approval_mode,
+                dry_run=settings.dry_run,
+                tracer=self.tracer,
+                verbose=settings.verbose,
+                max_history=settings.max_history,
+            )
+
         # Run the agent loop
         return self.agent.run()
 
 
 def main() -> None:
     """Entry point for the minicoder CLI."""
-    import os
-    
     cli = CLI()
     
     # Check for task in args or positional

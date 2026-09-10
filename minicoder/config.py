@@ -2,13 +2,34 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
-from typing import Dict, Any, Optional, Type, ClassVar
+from typing import Dict, Any
 
 
 def _load_env() -> None:
     """Load environment variables from .env file if present."""
     env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
     load_dotenv(env_path, override=False)
+
+
+# Environment variable mappings: env name -> (setting field, kind).
+# Kinds: "str" (override when set and non-empty), "int" (override when
+# parseable), "positive_int" (override when a positive integer),
+# "bool" (true for "true"/"1"/"yes", case-insensitive).
+_ENV_VARS: tuple[tuple[str, str, str], ...] = (
+    ("MINICODER_PROVIDER", "provider", "str"),
+    ("MINICODER_MODEL", "model", "str"),
+    ("MINICODER_BASE_URL", "base_url", "str"),
+    ("MINICODER_API_KEY", "api_key", "str"),
+    ("MINICODER_APPROVAL_MODE", "approval_mode", "str"),
+    ("MINICODER_WORKSPACE", "workspace", "str"),
+    ("MINICODER_MAX_ITERATIONS", "max_iterations", "int"),
+    ("MINICODER_MAX_TOOL_CALLS", "max_tool_calls", "int"),
+    ("MINICODER_TIMEOUT", "timeout", "positive_int"),
+    ("MINICODER_MAX_TOOL_OUTPUT_CHARS", "max_tool_output_chars", "positive_int"),
+    ("MINICODER_MAX_HISTORY", "max_history", "positive_int"),
+    ("MINICODER_DRY_RUN", "dry_run", "bool"),
+    ("MINICODER_VERBOSE", "verbose", "bool"),
+)
 
 
 @dataclass
@@ -28,6 +49,14 @@ class Settings:
     dry_run: bool = field(default=False)
     approval_mode: str = field(default="auto")
     verbose: bool = field(default=False)
+
+    # Context-budget: max characters kept per tool result. Larger outputs
+    # are head-truncated with an omission note. See tools/budget.py.
+    max_tool_output_chars: int = field(default=8000)
+
+    # History bound: at most this many messages are kept in agent state
+    # (the seed message is always preserved).
+    max_history: int = field(default=100)
     
     # Workspace
     workspace: str = field(default=".")
@@ -38,69 +67,22 @@ class Settings:
     
     def _initialize_from_env(self) -> None:
         """Initialize settings from environment variables."""
-        # Provider
-        env_provider = os.environ.get("MINICODER_PROVIDER")
-        if env_provider:
-            self.provider = env_provider
-        
-        # Model
-        env_model = os.environ.get("MINICODER_MODEL")
-        if env_model:
-            self.model = env_model
-        
-        # Base URL (for openai-compatible)
-        env_base_url = os.environ.get("MINICODER_BASE_URL")
-        if env_base_url:
-            self.base_url = env_base_url
-        
-        # API key
-        env_api_key = os.environ.get("MINICODER_API_KEY")
-        if env_api_key:
-            self.api_key = env_api_key
-        
-        # Iterations
-        env_max_iters = os.environ.get("MINICODER_MAX_ITERATIONS")
-        if env_max_iters:
-            try:
-                self.max_iterations = int(env_max_iters)
-            except ValueError:
-                pass
-        
-        # Tool calls limit
-        env_max_tool = os.environ.get("MINICODER_MAX_TOOL_CALLS")
-        if env_max_tool:
-            try:
-                self.max_tool_calls = int(env_max_tool)
-            except ValueError:
-                pass
-        
-        # Timeout
-        env_timeout = os.environ.get("MINICODER_TIMEOUT")
-        if env_timeout:
-            try:
-                self.timeout = int(env_timeout)
-            except ValueError:
-                pass
-        
-        # Dry run
-        env_dry = os.environ.get("MINICODER_DRY_RUN")
-        if env_dry:
-            self.dry_run = env_dry.lower() in ("true", "1", "yes")
-        
-        # Approval mode
-        env_approval = os.environ.get("MINICODER_APPROVAL_MODE")
-        if env_approval:
-            self.approval_mode = env_approval
-        
-        # Verbose
-        env_verbose = os.environ.get("MINICODER_VERBOSE")
-        if env_verbose:
-            self.verbose = env_verbose.lower() in ("true", "1", "yes")
-        
-        # Workspace
-        env_workspace = os.environ.get("MINICODER_WORKSPACE")
-        if env_workspace:
-            self.workspace = env_workspace
+        for env_name, field_name, kind in _ENV_VARS:
+            raw = os.environ.get(env_name)
+            if not raw:
+                continue
+            if kind == "str":
+                setattr(self, field_name, raw)
+            elif kind == "bool":
+                setattr(self, field_name, raw.lower() in ("true", "1", "yes"))
+            else:  # "int" or "positive_int"
+                try:
+                    value = int(raw)
+                except ValueError:
+                    continue
+                if kind == "positive_int" and value <= 0:
+                    continue
+                setattr(self, field_name, value)
     
     def get_provider_config(self, key: str, default: str = "") -> str:
         """Get provider-specific configuration."""
