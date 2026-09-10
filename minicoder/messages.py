@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional, List
 
 
@@ -8,6 +8,7 @@ class Message:
     role: str
     content: str
     tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
 
 
 @dataclass
