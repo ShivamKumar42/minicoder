@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "minicoder"
+version = "0.1.0"
+description = "Autonomous coding agent built from first principles"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.5",
+    "rich>=13.0",
+    "pytest>=7.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+minicoder = "minicoder.cli:main"
+
+[tool.pytest]
+testpaths = ["tests"]
+pythonpath = ["."]
