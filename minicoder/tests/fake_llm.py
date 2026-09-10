@@ -15,12 +15,8 @@ This simulates a genuine coding-agent trajectory:
 """
 
 from __future__ import annotations
-import json
-from dataclasses import dataclass, field
 from typing import Any, List, Optional, Dict
-from minicoder.messages import Message, ToolCall, ToolResult
-from minicoder.tools.registry import ToolRegistry
-from minicoder.tools.base import Tool
+from minicoder.messages import Message, ToolCall
 
 
 class FakeLLMClient:
@@ -30,13 +26,9 @@ class FakeLLMClient:
     in the demo project.
     """
 
-    # Trajectory state
-    _step: int = 0
-    _defects_fixed: int = 0
-    _max_defects: int = 2  # Fix 2 defects then finish
-
     def __init__(self, task: str = "") -> None:
         self.task = task
+        self._step: int = 0
         # Track which tools have been called
         self.call_history: List[dict[str, Any]] = []
 

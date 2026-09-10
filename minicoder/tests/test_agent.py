@@ -7,11 +7,6 @@ correctly without requiring API keys.
 from __future__ import annotations
 
 import pytest
-import sys
-import os
-
-# Add the project to the path
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from minicoder.messages import Message, ToolCall, ToolResult
 from minicoder.state import AgentState
@@ -168,9 +163,11 @@ class TestFakeLLM:
         messages = [Message(role="user", content="Fix bugs")]
         response = fake.generate(messages, tools=registry.get_tool_schemas())
 
-        # Should have tool calls
-        assert response["tool_calls"] is not None or response["content"] is not None
-        assert len(fake.call_history) > 0
+        # First step of the trajectory must list files.
+        assert len(response["tool_calls"]) == 1
+        assert response["tool_calls"][0].name == "list_files"
+        assert response["content"] != ""
+        assert len(fake.call_history) == 1
 
     def test_fake_llm_steps(self) -> None:
         """Test that the fake LLM follows the expected steps."""
@@ -187,7 +184,7 @@ class TestFakeLLM:
         for _ in range(10):
             response = fake.generate(messages)
             # Each call advances the step
-        assert fake._step > 1
+        assert fake._step == 11  # Exactly one step per generate call
 
 
 class TestConfig:
@@ -199,24 +196,15 @@ class TestConfig:
         assert settings.provider in ("openai", "anthropic", "openai-compatible")
         assert settings.model != ""
 
-    def test_env_override(self) -> None:
+    def test_env_override(self, monkeypatch) -> None:
         """Test environment variable overrides."""
-        import os
-        os.environ["MINICODER_PROVIDER"] = "anthropic"
-        os.environ["MINICODER_MODEL"] = "claude-3-haiku-20240307"
+        monkeypatch.setenv("MINICODER_PROVIDER", "anthropic")
+        monkeypatch.setenv("MINICODER_MODEL", "claude-3-haiku-20240307")
 
-        # Reimport to get new settings
-        import importlib
-        import minicoder.config
-        importlib.reload(minicoder.config)
-        settings = minicoder.config.get_settings()
+        settings = get_settings()
 
         assert settings.provider == "anthropic"
         assert settings.model == "claude-3-haiku-20240307"
-
-        # Cleanup
-        del os.environ["MINICODER_PROVIDER"]
-        del os.environ["MINICODER_MODEL"]
 
 
 class TestSafety:
@@ -264,8 +252,13 @@ class TestPrompts:
 
 
 # Integration test with fake LLM
-def test_agent_loop_with_fake_llm() -> None:
-    """Integration test: run the agent loop with FakeLLMClient."""
+def test_agent_loop_with_fake_llm(tmp_path) -> None:
+    """Integration test: run the agent loop with FakeLLMClient.
+
+    Hermetic: the workspace contains the exact files the fake
+    trajectory targets, and shell execution is stubbed, so no real
+    subprocesses run and no hardcoded paths are needed.
+    """
     import pytest
 
     from minicoder.agent import Agent
@@ -273,20 +266,62 @@ def test_agent_loop_with_fake_llm() -> None:
     from minicoder.tools.filesystem import ListFilesTool
     from minicoder.tools.read_file import ReadFileTool
     from minicoder.tools.apply_patch import ApplyPatchTool
-    from minicoder.tools.shell import RunCommandTool
     from minicoder.tools.search import SearchFilesTool
     from minicoder.tools.finish import FinishTool
     from minicoder.state import AgentState
+
+    workspace = tmp_path / "demo"
+    (workspace / "app").mkdir(parents=True)
+    (workspace / "tests").mkdir(parents=True)
+    # Files the fake trajectory reads (inspection steps).
+    (workspace / "app" / "calculator.py").write_text(
+        'def add(a: int, b: int) -> int:\n    return a - b\n',
+        encoding="utf-8",
+    )
+    (workspace / "app" / "validators.py").write_text(
+        'def validate_password(password: str) -> bool:\n    return len(password) >= 3\n',
+        encoding="utf-8",
+    )
+    (workspace / "tests" / "test_calculator.py").write_text(
+        "def test_add():\n    assert True\n", encoding="utf-8"
+    )
+    (workspace / "tests" / "test_validators.py").write_text(
+        "def test_validate():\n    assert True\n", encoding="utf-8"
+    )
+    # Files the fake trajectory patches (exact anchors it sends).
+    (workspace / "app" / "calc_test.py").write_text(
+        'def add(a: int, b: int) -> int:\n'
+        '    """Add two numbers. BUG: subtracts instead of adding."""\n'
+        '    return a - b\n',
+        encoding="utf-8",
+    )
+    (workspace / "app" / "val_test.py").write_text(
+        'def validate_password(password: str) -> bool:\n'
+        '    """Validate password. BUG: accepts short passwords."""\n'
+        '    if len(password) < 3:  # BUG: should be < 8\n'
+        '        return False\n',
+        encoding="utf-8",
+    )
+
+    class StubRunCommand(Tool):
+        name = "run_command"
+        description = "Stubbed shell for tests"
+
+        def _build_schema(self) -> dict[str, Any]:
+            return {"type": "object", "properties": {}}
+
+        def execute(self, **kwargs: Any) -> Any:
+            return "3 passed"
 
     fake = FakeLLMClient(task="Fix bugs in calculator and validators")
     registry = ToolRegistry()
 
     # Register all tools
-    registry.register(ListFilesTool(workspace="/tmp"))
-    registry.register(ReadFileTool(workspace="/tmp"))
-    registry.register(ApplyPatchTool(workspace="/tmp"))
-    registry.register(RunCommandTool(workspace="/tmp"))
-    registry.register(SearchFilesTool(workspace="/tmp"))
+    registry.register(ListFilesTool(workspace=str(workspace)))
+    registry.register(ReadFileTool(workspace=str(workspace)))
+    registry.register(ApplyPatchTool(workspace=str(workspace)))
+    registry.register(StubRunCommand())
+    registry.register(SearchFilesTool(workspace=str(workspace)))
     registry.register(FinishTool())
 
     # Create agent
@@ -294,7 +329,7 @@ def test_agent_loop_with_fake_llm() -> None:
         llm_client=fake,
         registry=registry,
         task="Fix bugs in calculator and validators",
-        workspace="/tmp",
+        workspace=str(workspace),
         max_iterations=20,
         max_tool_calls=50,
         approval_mode="auto",
@@ -305,8 +340,12 @@ def test_agent_loop_with_fake_llm() -> None:
     # Run the agent
     result = agent.run()
 
-    # Verify results
+    # Verify results: both patches applied, reported, and no errors.
     assert result["finished"] is True
     assert result["iterations"] > 0
     assert result["tool_calls"] > 0
-    assert len(result["errors"]) == 0  # No errors expected with fake LLM
+    assert result["final_response"]
+    assert result["errors"] == []
+    assert sorted(result["modified_files"]) == ["app/calc_test.py", "app/val_test.py"]
+    assert "return a + b" in (workspace / "app" / "calc_test.py").read_text(encoding="utf-8")
+    assert "len(password) < 8" in (workspace / "app" / "val_test.py").read_text(encoding="utf-8")
