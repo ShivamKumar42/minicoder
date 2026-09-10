@@ -1,9 +1,16 @@
 from __future__ import annotations
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 from .base import Tool
 
 
 class ToolRegistry:
+    """Stores tools in the canonical internal representation.
+
+    Each entry: {"name": str, "description": str,
+                 "parameter_schema": JSON Schema dict}.
+    Use llm.tool_schemas.to_openai_tools / to_anthropic_tools to
+    convert to provider API formats before sending.
+    """
     def __init__(self) -> None:
         self._tools: Dict[str, Tool] = {}
 

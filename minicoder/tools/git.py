@@ -3,13 +3,16 @@ import subprocess
 import os
 from typing import Dict, Any, Optional
 from .base import Tool
+from .budget import DEFAULT_MAX_OUTPUT_CHARS, truncate_text
 
 
 class GitDiffTool(Tool):
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, max_chars: int = DEFAULT_MAX_OUTPUT_CHARS):
         super().__init__()
         self.name = "git_diff"
+        self.description = "Show uncommitted git changes"
         self.workspace = os.path.abspath(workspace)
+        self.max_chars = max_chars
 
     def _build_schema(self) -> Dict[str, Any]:
         return {
@@ -24,22 +27,30 @@ class GitDiffTool(Tool):
         }
 
     def execute(self, path: str = "") -> str:
-        full_path = self.workspace
+        args = ["git", "diff"]
         if path:
             target = os.path.join(self.workspace, path)
-            if os.path.isdir(target):
-                full_path = target
+            if not os.path.exists(target):
+                return f"Error: Path does not exist: {path}"
+            args += ["--", target]
 
         try:
             result = subprocess.run(
-                ["git", "diff"],
-                cwd=full_path,
+                args,
+                cwd=self.workspace,
                 capture_output=True,
                 text=True,
                 timeout=30
             )
             if result.returncode == 0:
-                return result.stdout if result.stdout else "No diff available"
+                if not result.stdout:
+                    return "No diff available"
+                output, _ = truncate_text(
+                    result.stdout,
+                    self.max_chars,
+                    hint="(narrow path to see the rest)",
+                )
+                return output
             else:
                 return f"Error running git diff: {result.stderr}"
         except subprocess.TimeoutExpired:
@@ -49,10 +60,12 @@ class GitDiffTool(Tool):
 
 
 class GitStatusTool(Tool):
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, max_chars: int = DEFAULT_MAX_OUTPUT_CHARS):
         super().__init__()
         self.name = "git_status"
+        self.description = "Show git working-tree status"
         self.workspace = os.path.abspath(workspace)
+        self.max_chars = max_chars
 
     def _build_schema(self) -> Dict[str, Any]:
         return {
@@ -86,7 +99,14 @@ class GitStatusTool(Tool):
                 )
 
             if result.returncode == 0:
-                return result.stdout if result.stdout else "No git status available"
+                if not result.stdout:
+                    return "No git status available"
+                output, _ = truncate_text(
+                    result.stdout,
+                    self.max_chars,
+                    hint="(narrow the workspace to see the rest)",
+                )
+                return output
             else:
                 return f"Error running git status: {result.stderr}"
         except subprocess.TimeoutExpired:

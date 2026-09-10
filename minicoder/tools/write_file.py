@@ -2,12 +2,14 @@ from __future__ import annotations
 import os
 from typing import Dict, Any, Optional
 from .base import Tool
+from .paths import is_within_workspace, resolve_workspace_path
 
 
 class WriteFileTool(Tool):
     def __init__(self, workspace: str):
         super().__init__()
         self.name = "write_file"
+        self.description = "Create or overwrite a file with the given content"
         self.workspace = os.path.abspath(workspace)
 
     def _build_schema(self) -> Dict[str, Any]:
@@ -27,13 +29,10 @@ class WriteFileTool(Tool):
         }
 
     def execute(self, path: str, content: str) -> str:
-        full_path = os.path.join(self.workspace, path)
+        full_path = resolve_workspace_path(self.workspace, path)
 
         # Security: ensure file is within workspace
-        abs_workspace = os.path.abspath(self.workspace)
-        abs_full = os.path.abspath(full_path)
-
-        if not abs_full.startswith(abs_workspace + os.sep) and abs_full != abs_workspace:
+        if not is_within_workspace(self.workspace, path):
             return f"Error: Path escapes workspace: {path}"
 
         # Create parent directories if needed
