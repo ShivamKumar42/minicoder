@@ -1,112 +1,19 @@
 from __future__ import annotations
-from typing import Any, List, Optional, Dict
-import os
+from typing import Any, ClassVar, List, Optional, Dict
 
-from .base import LLMClient
-from ..messages import Message, ToolCall, ToolResult
+from .openai_base import OpenAIChatBase
+from ..messages import Message, ToolCall
 
 
-class OpenAICompatibleClient(LLMClient):
-    def __init__(
-        self,
-        model: str,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-    ):
-        self._model = model
-        self._api_key = api_key or os.environ.get("OPENAI_COMPATIBLE_API_KEY", "")
-        self._base_url = base_url or os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "http://localhost:11434/v1")
+class OpenAICompatibleClient(OpenAIChatBase):
+    _PROVIDER_NAME: ClassVar[str] = "openai-compatible"
+    _ENV_API_KEY: ClassVar[str] = "OPENAI_COMPATIBLE_API_KEY"
+    _ENV_BASE_URL: ClassVar[Optional[str]] = "OPENAI_COMPATIBLE_BASE_URL"
+    _DEFAULT_BASE_URL: ClassVar[Optional[str]] = "http://localhost:11434/v1"
 
-    @property
-    def model(self) -> str:
-        return self._model
-
-    @property
-    def provider(self) -> str:
-        return "openai-compatible"
-
-    @classmethod
-    def supports_tools(cls) -> bool:
-        return True
-
+    # Backwards-compatible aliases for the historical method names.
     def _build_messages(self, messages: List[Message]) -> List[Dict[str, Any]]:
-        result: List[Dict[str, Any]] = []
-        for msg in messages:
-            openai_msg: Dict[str, Any] = {"role": msg.role, "content": msg.content}
-            if msg.tool_calls:
-                openai_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": str(tc.arguments)},
-                    }
-                    for tc in msg.tool_calls
-                ]
-            result.append(openai_msg)
-        return result
+        return self._build_openai_messages(messages)
 
     def _parse_tool_calls(self, tool_calls: Any) -> List[ToolCall]:
-        parsed: List[ToolCall] = []
-        if tool_calls is None:
-            return parsed
-        for tc in tool_calls:
-            parsed.append(
-                ToolCall(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=eval(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments,
-                )
-            )
-        return parsed
-
-    def generate(
-        self,
-        messages: List[Message],
-        tools: Optional[List[Dict[str, Any]]] = None,
-    ) -> Any:
-        import openai
-
-        client = openai.OpenAI(
-            api_key=self._api_key, base_url=self._base_url
-        )
-
-        openai_messages = self._build_messages(messages)
-
-        response = client.chat.completions.create(
-            model=self._model,
-            messages=openai_messages,
-            tools=tools,
-        )
-
-        if response.choices[0].message.tool_calls:
-            tool_calls = self._parse_tool_calls(response.choices[0].message.tool_calls)
-        else:
-            tool_calls = []
-
-        return {
-            "role": response.choices[0].message.role,
-            "content": response.choices[0].message.content or "",
-            "tool_calls": tool_calls,
-        }
-
-    def stream(
-        self,
-        messages: List[Message],
-        tools: Optional[List[Dict[str, Any]]] = None,
-    ) -> Any:
-        import openai
-
-        client = openai.OpenAI(
-            api_key=self._api_key, base_url=self._base_url
-        )
-
-        openai_messages = self._build_messages(messages)
-
-        stream = client.chat.completions.create(
-            model=self._model,
-            messages=openai_messages,
-            tools=tools,
-            stream=True,
-        )
-
-        return stream
+        return self._parse_openai_tool_calls(tool_calls)

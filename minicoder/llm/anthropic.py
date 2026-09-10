@@ -3,6 +3,7 @@ from typing import Any, List, Optional, Dict
 import os
 
 from .base import LLMClient
+from .tool_schemas import to_anthropic_tools
 from ..messages import Message, ToolCall, ToolResult
 
 
@@ -29,85 +30,117 @@ class AnthropicClient(LLMClient):
     def supports_tools(cls) -> bool:
         return True
 
-    def _build_anthropic_messages(self, messages: List[Message]) -> List[Dict[str, Any]]:
-        # Normalize to Anthropic format: system + user/assistant blocks
-        result: List[Dict[str, Any]] = []
-        system_block: Optional[Dict[str, Any]] = None
+    def _build_anthropic_messages(
+        self, messages: List[Message]
+    ) -> tuple[Optional[str], List[Dict[str, Any]]]:
+        """Split internal messages into Anthropic (system, messages).
+
+        Anthropic takes `system` as a separate top-level parameter and
+        `messages` with only user/assistant roles in strict alternation.
+        Internal `tool` messages are forwarded as user context, and
+        consecutive same-role messages are merged so the sequence stays
+        valid (no invented fields).
+        """
+        system_parts: List[str] = []
+        merged: List[Dict[str, Any]] = []
+
+        def _push(role: str, content: str) -> None:
+            if merged and merged[-1]["role"] == role:
+                merged[-1]["content"] += "\n\n" + content
+            else:
+                merged.append({"role": role, "content": content})
 
         for msg in messages:
             if msg.role == "system":
-                system_block = {"role": "system", "content": msg.content}
-            elif msg.role == "user":
-                result.append({"role": "user", "content": msg.content})
+                system_parts.append(msg.content)
             elif msg.role == "assistant":
-                block: Dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-                if msg.tool_calls:
-                    block["tool_calls"] = [
-                        {
-                            "id": tc.id,
-                            "type": "tool",
-                            "function": {"name": tc.name, "arguments": str(tc.arguments)},
-                        }
-                        for tc in msg.tool_calls
-                    ]
-                result.append(block)
+                _push("assistant", msg.content or "")
+            elif msg.role in ("user", "tool"):
+                _push("user", msg.content)
+            else:
+                _push("user", msg.content)
 
-        if system_block:
-            result.insert(0, system_block)
-
-        return result
+        system = "\n".join(system_parts) if system_parts else None
+        return system, merged
 
     def _parse_anthropic_tool_calls(self, tool_calls: Any) -> List[ToolCall]:
+        """Normalize Anthropic tool_use blocks to internal ToolCall."""
         parsed: List[ToolCall] = []
         if tool_calls is None:
             return parsed
-        # Anthropic returns tool_calls in a specific format
         for tc in tool_calls:
-            parsed.append(
-                ToolCall(
-                    id=getattr(tc, 'id', str(tc.get('id', ''))),
-                    name=getattr(tc, 'name', str(tc.get('name', ''))),
-                    arguments=getattr(tc, 'input', str(tc.get('input', {}))),
-                )
-            )
+            if isinstance(tc, dict):
+                tc_id = str(tc.get("id", ""))
+                tc_name = str(tc.get("name", ""))
+                tc_input = tc.get("input", {})
+            else:
+                tc_id = str(getattr(tc, "id", ""))
+                tc_name = str(getattr(tc, "name", ""))
+                tc_input = getattr(tc, "input", {})
+            if not isinstance(tc_input, dict):
+                tc_input = {}
+            parsed.append(ToolCall(id=tc_id, name=tc_name, arguments=tc_input))
         return parsed
+
+    @staticmethod
+    def _extract_anthropic_text(content: Any) -> str:
+        """Join all text blocks; ignore tool_use blocks."""
+        texts: List[str] = []
+        for block in content or []:
+            block_type = (
+                block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+            )
+            if block_type != "text":
+                continue
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", "")
+            if isinstance(text, str) and text:
+                texts.append(text)
+        return "".join(texts)
 
     def generate(
         self,
         messages: List[Message],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Any:
+        system, anthropic_messages = self._build_anthropic_messages(messages)
+        if not anthropic_messages:
+            raise ValueError("No messages to send to the model")
+
         import anthropic
 
         client = anthropic.Anthropic(api_key=self._api_key)
 
-        anthropic_messages = self._build_anthropic_messages(messages)
+        converted_tools = to_anthropic_tools(tools)
+        create_kwargs: Dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": 4096,
+            "messages": anthropic_messages,
+            "tools": converted_tools,
+        }
+        if converted_tools:
+            create_kwargs["tool_choice"] = "auto"
+        if system:
+            create_kwargs["system"] = system
 
-        response = client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            messages=anthropic_messages,
-            tools=tools or [],
-            tool_choice="auto",
-        )
+        response = client.messages.create(**create_kwargs)
 
-        tool_calls: List[ToolCall] = []
+        tool_use_blocks: List[Any] = []
         if hasattr(response, 'content') and response.content:
             for block in response.content:
-                if hasattr(block, 'type') and block.type == 'tool_use':
-                    tool_calls.append(
-                        ToolCall(
-                            id=block.id,
-                            name=block.name,
-                            arguments=block.input,
-                        )
-                    )
-                elif hasattr(block, 'type') and block.type == 'text':
-                    pass  # content is in block.text
+                block_type = getattr(block, 'type', None)
+                if isinstance(block, dict):
+                    block_type = block.get('type')
+                if block_type == 'tool_use':
+                    tool_use_blocks.append(block)
+
+        tool_calls = self._parse_anthropic_tool_calls(tool_use_blocks)
+        content = self._extract_anthropic_text(
+            response.content if hasattr(response, 'content') else []
+        )
 
         return {
             "role": "assistant",
-            "content": response.content[0].text if response.content else "",
+            "content": content,
             "tool_calls": tool_calls,
         }
 
@@ -120,15 +153,21 @@ class AnthropicClient(LLMClient):
 
         client = anthropic.Anthropic(api_key=self._api_key)
 
-        anthropic_messages = self._build_anthropic_messages(messages)
+        system, anthropic_messages = self._build_anthropic_messages(messages)
 
-        stream = client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            messages=anthropic_messages,
-            tools=tools or [],
-            tool_choice="auto",
-            stream=True,
-        )
+        converted_tools = to_anthropic_tools(tools)
+        create_kwargs: Dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": 4096,
+            "messages": anthropic_messages,
+            "tools": converted_tools,
+            "stream": True,
+        }
+        if converted_tools:
+            create_kwargs["tool_choice"] = "auto"
+        if system:
+            create_kwargs["system"] = system
+
+        stream = client.messages.create(**create_kwargs)
 
         return stream
